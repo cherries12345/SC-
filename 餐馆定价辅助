@@ -1,0 +1,195 @@
+// ==UserScript==
+// @name         定价计算
+// @namespace    http://tampermonkey.net/
+// @version      1.1
+// @description  餐厅定价自动计算
+// @author       cherries
+// @match        https://www.simcompanies.com/*
+// @grant        none
+// @run-at       document-end
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    if (!location.pathname.includes('/zh-cn/b/')) return;
+
+    let latestRating = null;
+    // 存储的是6分对应的值，默认70
+    let calibrateOffset = Number(localStorage.getItem('sim_restaurant_offset')) || 70;
+    let fillBtn = null;
+
+    // 公式：价格 = (rating - 6) * 斜率 + calibrateOffset
+    // 斜率 = (价格变化)/(评分变化) = (70-?)/(6-6) 需要重新定义
+    // 改为：价格 = rating * 10 - 50 + (calibrateOffset - 70) 
+    // 更简单的方式：存储6分对应的值，然后用线性变换
+    // 设价格 = a * rating + b，已知6分→calibrateOffset，且每1分差价固定为10
+    // 即 a=10, 则 b = calibrateOffset - 60
+    const calcValue = r => Math.round(r * 10 + (calibrateOffset - 60));
+
+    function setReactInputValue(input, value) {
+        const nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+        if (nativeSetter) nativeSetter.call(input, value);
+        else input.value = value;
+
+        ['input', 'change', 'blur'].forEach(type => {
+            input.dispatchEvent(new Event(type, { bubbles: true }));
+        });
+
+        const reactKey = Object.keys(input).find(k => k.startsWith('__react'));
+        const fiber = input[reactKey];
+        if (fiber?.memoizedProps) {
+            const ev = { target: input, currentTarget: input };
+            fiber.memoizedProps.onChange?.(ev);
+            fiber.memoizedProps.onInput?.(ev);
+        }
+    }
+
+    function processApiData(data) {
+        if (!data || !Array.isArray(data)) return;
+        const sorted = [...data].sort((a, b) => new Date(b.datetime) - new Date(a.datetime));
+        const latest = sorted[0];
+        if (latest?.rating && latest.rating !== latestRating) {
+            latestRating = latest.rating;
+            console.log(`[餐厅] 评级: ${latestRating} 推荐: ${calcValue(latestRating)}`);
+            if (fillBtn) fillBtn.textContent = `${calcValue(latestRating)}`;
+        }
+    }
+
+    const origFetch = window.fetch;
+    window.fetch = function(...args) {
+        const url = args[0];
+        if (typeof url === 'string' && url.includes('/restaurant-runs/')) {
+            return origFetch.apply(this, args).then(res => {
+                res.clone().json().then(processApiData).catch(()=>{});
+                return res;
+            });
+        }
+        return origFetch.apply(this, args);
+    };
+
+    const XHR = XMLHttpRequest.prototype;
+    const origOpen = XHR.open;
+    const origSend = XHR.send;
+    XHR.open = function(method, url, ...rest) {
+        this._url = url;
+        return origOpen.apply(this, [method, url, ...rest]);
+    };
+    XHR.send = function(...args) {
+        if (this._url && this._url.includes('/restaurant-runs/')) {
+            this.addEventListener('load', () => {
+                if (this.status >= 200 && this.status < 300) {
+                    try {
+                        processApiData(JSON.parse(this.responseText));
+                    } catch(e) {}
+                }
+            });
+        }
+        return origSend.apply(this, args);
+    };
+
+    function findPriceInput() {
+        const selectors = [
+            'input[type="number"].form-control',
+            'input.form-control[type="number"]',
+            'input[placeholder*="价格"]',
+            'input[placeholder*="Price"]',
+            'input[name*="price" i]'
+        ];
+        for (let sel of selectors) {
+            let el = document.querySelector(sel);
+            if (el && el.offsetParent !== null) return el;
+        }
+        let all = document.querySelectorAll('input[type="number"]');
+        for (let inp of all) {
+            if (inp.offsetParent !== null && inp.closest('.building-details')) return inp;
+        }
+        return null;
+    }
+
+    function findSaveButton() {
+        const btns = document.querySelectorAll('button');
+        for (let btn of btns) {
+            let text = (btn.innerText || '').toLowerCase();
+            if (text.includes('保存') || text.includes('save') || text.includes('确认')) {
+                if (btn.offsetParent !== null) return btn;
+            }
+        }
+        return null;
+    }
+
+    function updateButtonText() {
+        if (fillBtn) fillBtn.textContent = latestRating !== null ? `${calcValue(latestRating)}` : '?';
+    }
+
+    function ensureButtons() {
+        if (!location.pathname.includes('/zh-cn/b/')) return;
+        const input = findPriceInput();
+        if (!input) return;
+        if (document.getElementById('sim-rating-btn')) return;
+
+        const container = document.createElement('div');
+        container.id = 'sim-rating-btn';
+        container.style.cssText = 'margin-top:5px;display:flex;gap:8px';
+
+        fillBtn = document.createElement('button');
+        fillBtn.textContent = latestRating !== null ? `${calcValue(latestRating)}` : '?';
+        fillBtn.style.cssText = 'padding:4px 12px;background:#4CAF50;color:white;border:none;border-radius:4px;cursor:pointer;font-size:14px;min-width:60px';
+        fillBtn.onclick = () => {
+            if (latestRating === null) {
+                fillBtn.textContent = '无数据';
+                setTimeout(updateButtonText, 1500);
+                return;
+            }
+            const val = calcValue(latestRating);
+            const priceInput = findPriceInput();
+            if (priceInput) {
+                setReactInputValue(priceInput, val);
+                setTimeout(() => {
+                    const saveBtn = findSaveButton();
+                    if (saveBtn) saveBtn.click();
+                    else console.log('[餐厅] 未找到保存按钮，请手动保存');
+                }, 80);
+            }
+        };
+
+        const calibBtn = document.createElement('button');
+        calibBtn.textContent = `${calibrateOffset}`;
+        calibBtn.style.cssText = 'padding:4px 12px;background:#FF9800;color:white;border:none;border-radius:4px;cursor:pointer;font-size:14px;min-width:60px';
+        calibBtn.onclick = () => {
+            let v = parseFloat(prompt(`6分对应值（当前差值为10/分）: ${calibrateOffset}`, calibrateOffset));
+            if (!isNaN(v)) {
+                calibrateOffset = v;
+                localStorage.setItem('sim_restaurant_offset', calibrateOffset);
+                updateButtonText();
+                calibBtn.textContent = v;
+            }
+        };
+
+        container.append(fillBtn, calibBtn);
+        input.parentNode.insertBefore(container, input.nextSibling);
+        console.log('[定价] 按钮已添加（基准：6分→' + calibrateOffset + '，每分差10）');
+    }
+
+    let retryInterval = setInterval(() => {
+        if (location.pathname.includes('/zh-cn/b/')) {
+            ensureButtons();
+        }
+    }, 2000);
+
+    window.addEventListener('load', () => {
+        setTimeout(ensureButtons, 500);
+    });
+
+    let lastUrl = location.href;
+    new MutationObserver(() => {
+        if (location.href !== lastUrl) {
+            lastUrl = location.href;
+            if (location.pathname.includes('/zh-cn/b/')) {
+                setTimeout(ensureButtons, 500);
+            }
+        }
+    }).observe(document, { subtree: true, childList: true });
+
+    console.log('6分→70');
+})();
